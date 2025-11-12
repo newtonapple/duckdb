@@ -4,13 +4,14 @@ This document provides a comprehensive overview of all GitHub Actions workflows 
 
 ## Table of Contents
 1. [Workflow Categories](#workflow-categories)
-2. [Core CI/CD Workflows](#core-cicd-workflows)
-3. [Extension Workflows](#extension-workflows)
-4. [Test Workflows](#test-workflows)
-5. [PR and Issue Management Workflows](#pr-and-issue-management-workflows)
-6. [Specialized Workflows](#specialized-workflows)
-7. [Release Process Flow](#release-process-flow)
-8. [Quick Reference Tables](#quick-reference-tables)
+2. [Fork Safety and S3 Uploads](#fork-safety-and-s3-uploads)
+3. [Core CI/CD Workflows](#core-cicd-workflows)
+4. [Extension Workflows](#extension-workflows)
+5. [Test Workflows](#test-workflows)
+6. [PR and Issue Management Workflows](#pr-and-issue-management-workflows)
+7. [Specialized Workflows](#specialized-workflows)
+8. [Release Process Flow](#release-process-flow)
+9. [Quick Reference Tables](#quick-reference-tables)
 
 ---
 
@@ -36,6 +37,69 @@ DuckDB's GitHub Actions are organized into 6 main categories:
 │                    └──────────────┘                        │
 └────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Fork Safety and S3 Uploads
+
+**Critical for Contributors**: All workflows in this repository include multiple safety layers to prevent unauthorized S3 uploads from forks.
+
+### S3 Upload Protection Mechanisms
+
+The `scripts/upload-assets-to-staging.sh` script implements several checks:
+
+```bash
+# 1. Repository owner check - exits immediately if not duckdb org
+if [ "$GITHUB_REPOSITORY_OWNER" != "duckdb" ]; then
+  echo "Repository is $GITHUB_REPOSITORY_OWNER (not duckdb)"
+  exit 0  # Fork exits here - no upload attempt
+fi
+
+# 2. Repository name check - dry-run mode if not duckdb/duckdb
+if [ "$GITHUB_REPOSITORY" != "duckdb/duckdb" ]; then
+  DRY_RUN_PARAM="--dryrun"  # Simulates upload without actually uploading
+fi
+
+# 3. Branch check - dry-run if not on main
+if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+  DRY_RUN_PARAM="--dryrun"
+fi
+
+# 4. Credentials check - dry-run if AWS keys missing
+if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+  DRY_RUN_PARAM="--dryrun"
+fi
+```
+
+### What Happens in Forks
+
+**When you fork duckdb/duckdb:**
+
+1. **S3 Uploads**: Script exits immediately (no upload attempt)
+2. **Extension Uploads**: Missing secrets cause graceful failure
+3. **Code Signing**:
+   - Apple code signing (OSX.yml): Only runs if `GITHUB_REPOSITORY == 'duckdb/duckdb'`
+   - Azure code signing (Windows.yml): Only runs if `github.repository == 'duckdb/duckdb' && github.event_name != 'pull_request'`
+4. **Workflow Execution**: All other build and test steps run normally
+
+**Result**: Forks can test builds locally without any risk of unauthorized uploads or deployments.
+
+### S3 Bucket Structure
+
+DuckDB uses two separate S3 buckets:
+
+**1. Staging Bucket** (`s3://duckdb-staging/`)
+- **Path**: `s3://duckdb-staging/{commit-sha}/[{version-tag}/]duckdb/duckdb/github_release/`
+- **Purpose**: Temporary storage between build and release
+- **Contains**: CLI binaries, libraries, headers, amalgamation files
+- **Uploaded by**: LinuxRelease.yml, OSX.yml, Windows.yml, BundleStaticLibs.yml
+
+**2. Extension Repository** (`s3://duckdb-core-extensions/`)
+- **Path**: `s3://duckdb-core-extensions/{version}/{arch}/{extension}.duckdb_extension.gz`
+- **Purpose**: Runtime extension auto-loading/auto-install
+- **Contains**: All DuckDB extensions (signed .duckdb_extension files)
+- **Uploaded by**: Extensions.yml
+- **Accessed by**: DuckDB CLI/clients at runtime via `INSTALL` and `LOAD` commands
 
 ---
 
@@ -264,10 +328,25 @@ Orchestrates building all DuckDB extensions across all platforms, merges them in
 - **Rust-based**: delta
 
 **Artifacts:**
-- `main-extensions-{sha}*` - Main extensions per architecture
-- `rust-based-extensions-{sha}*` - Rust extensions per architecture
-- `extension-repository-{sha}` - Merged repository with all .duckdb_extension files
-- `extension_entries.hpp` - Updated extension entries header
+- `main-extensions-{sha}*` - Main extensions per architecture (GitHub Actions artifacts)
+- `rust-based-extensions-{sha}*` - Rust extensions per architecture (GitHub Actions artifacts)
+- `extension-repository-{sha}` - Merged repository with all .duckdb_extension files (GitHub Actions artifacts)
+- `extension_entries.hpp` - Updated extension entries header (GitHub Actions artifacts)
+- Extensions uploaded to S3: `s3://duckdb-core-extensions/{version}/{arch}/{extension}.duckdb_extension.gz`
+
+**S3 Upload Details:**
+
+The `upload-extensions` job uploads to the extension repository bucket:
+- **Bucket**: `s3://duckdb-core-extensions/`
+- **Path**: `{version}/{arch}/{extension}.duckdb_extension.gz`
+- **Signing**: Extensions are signed with `DUCKDB_EXTENSION_SIGNING_PK` before upload
+- **Access**: Public read access for DuckDB clients at runtime
+- **Usage**: When users run `INSTALL extension_name;`, DuckDB downloads from this bucket
+
+**Fork Protection:**
+- Requires `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` secrets
+- Forks without these secrets will skip upload (graceful failure)
+- Environment variable `DUCKDB_DEPLOY_SCRIPT_MODE: for_real` required for actual uploads
 
 **Flow Diagram:**
 ```
@@ -334,32 +413,65 @@ Reusable workflow for testing extensions with DuckDB client libraries (Python).
 ### 4. NotifyExternalRepositories.yml - Cross-Repository Notifications
 
 **Triggers:**
-- Called by other workflows (workflow_call)
+- Called by other workflows (workflow_call) - primarily InvokeCI.yml
 - Manual dispatch
 - Inputs: duckdb-sha, target-branch, triggering-event, should-publish, is-success, override-git-describe
 
 **Purpose:**
-Notifies external DuckDB repositories (ODBC, JDBC, Python, build-status) to trigger their workflows.
+Notifies external DuckDB repositories (ODBC, JDBC, Python, build-status) to trigger their workflows. These external repos then vendor the DuckDB source code and build language-specific bindings/packages.
 
 **Key Jobs:**
-- `notify-odbc-run`: Triggers duckdb-odbc's Vendor.yml
-- `notify-jdbc-run`: Triggers duckdb-java's Vendor.yml
-- `notify-nightly-build-status`: Triggers duckdb-build-status's NightlyBuildsCheck.yml
-- `notify-python-nightly`: Triggers duckdb-python's release.yml
 
-**Artifacts:** None (only triggers external workflows)
+1. **`notify-odbc-run`**: Triggers duckdb-odbc's Vendor.yml
+   - **What it does**: duckdb-odbc vendors DuckDB source and builds ODBC drivers
+   - **Condition**: Only if `is-success == true` and NOT on release tags
+   - **Output**: ODBC drivers for various platforms
+
+2. **`notify-jdbc-run`**: Triggers duckdb-java's Vendor.yml
+   - **What it does**: duckdb-java vendors DuckDB source and builds JDBC drivers
+   - **Condition**: Only if `is-success == true` and NOT on release tags
+   - **Output**: JDBC jars published to Maven Central
+
+3. **`notify-python-nightly`**: Triggers duckdb-python's release.yml
+   - **What it does**: duckdb-python vendors DuckDB source and builds Python wheels
+   - **Condition**: Always runs (even on release tags)
+   - **Output**: Python wheels published to PyPI (for nightly builds or releases)
+   - **Parameters**: Passes `duckdb-sha` and `pypi-index` (test vs production)
+
+4. **`notify-nightly-build-status`**: Triggers duckdb-build-status's NightlyBuildsCheck.yml
+   - **What it does**: Updates nightly build status dashboard
+   - **Condition**: Always runs
+   - **Output**: Status updates on build success/failure
+
+**Important Notes:**
+- **ODBC and JDBC**: Only trigger on nightly/main builds, NOT on releases
+- **Python**: Triggers on both nightly builds AND releases
+- **Build Status**: Always runs to track all builds
+
+**Artifacts:** None (only triggers external workflows via GitHub API)
+
+**External Repository Outputs:**
+
+After notification, external repos produce:
+- **duckdb-python** → PyPI packages (`pip install duckdb`)
+- **duckdb-java** → Maven Central artifacts (JDBC)
+- **duckdb-odbc** → ODBC drivers for Windows, Linux, macOS
 
 **Flow Diagram:**
 ```
-Caller → NotifyExternalRepositories.yml
-          │
-          ├─→ notify-odbc-run ──────────→ duckdb-odbc (Vendor.yml)
-          │
-          ├─→ notify-jdbc-run ──────────→ duckdb-java (Vendor.yml)
-          │
-          ├─→ notify-nightly-build-status → duckdb-build-status (NightlyBuildsCheck.yml)
-          │
-          └─→ notify-python-nightly ─────→ duckdb-python (release.yml)
+Caller (InvokeCI.yml) → NotifyExternalRepositories.yml
+                         │
+                         ├─→ notify-odbc-run ──────────→ duckdb-odbc (Vendor.yml)
+                         │                               └─→ Builds ODBC drivers
+                         │
+                         ├─→ notify-jdbc-run ──────────→ duckdb-java (Vendor.yml)
+                         │                               └─→ Builds JDBC jars → Maven
+                         │
+                         ├─→ notify-python-nightly ────→ duckdb-python (release.yml)
+                         │                               └─→ Builds Python wheels → PyPI
+                         │
+                         └─→ notify-nightly-build-status → duckdb-build-status (NightlyBuildsCheck.yml)
+                                                          └─→ Updates build dashboard
 ```
 
 ---
@@ -635,11 +747,70 @@ PR Marked Ready ─────────→ DraftMeNot.yml ──→ Cancel D
 ### 4. InvokeCI.yml - Master CI Orchestrator
 
 **Triggers:**
-- Repository dispatch
-- Manual dispatch
+- Repository dispatch (external API calls)
+- Manual dispatch (GitHub UI)
 
 **Purpose:**
-Master workflow that invokes all major CI pipelines in parallel and notifies external repos.
+Master workflow that invokes all major CI pipelines in parallel and notifies external repos. **This is NOT triggered automatically** by pushes, PRs, or tags - it must be manually invoked or triggered via API.
+
+**Key Inputs:**
+- `git_ref` (string, optional): Which commit/branch/tag to build
+  - If empty: Builds from the workflow's triggering commit
+  - If provided: Checks out and builds from the specified ref
+- `override_git_describe` (string, optional): Version string for binaries and S3 path
+- `skip_tests` (string, optional): Skip test execution
+- `run_all` (string, optional): Build all architectures (including win32/arm64)
+- `twine_upload` (string, optional): Upload Python packages to PyPI
+
+**Commit Selection Logic:**
+
+All downstream workflows receive both inputs and use them like this:
+```yaml
+- uses: actions/checkout@v4
+  with:
+    ref: ${{ inputs.git_ref }}  # Empty = triggering commit, else specified ref
+```
+
+**Important Notes:**
+- Artifact names use `github.sha` (the triggering commit's SHA)
+- Builds use the code from `git_ref` (which may be different)
+- S3 paths use the **actual built commit's SHA** (from `git log -1`)
+
+**Typical Usage Scenarios:**
+
+1. **Pre-release builds** (most common):
+   ```
+   User triggers InvokeCI with:
+     git_ref: "main"
+     override_git_describe: "v1.2.3"
+
+   Result:
+     - Checks out current HEAD of main branch (e.g., commit def456)
+     - Builds from def456
+     - Version in binaries shows "v1.2.3"
+     - S3 path: s3://duckdb-staging/def456/v1.2.3/...
+   ```
+
+2. **Testing specific commit**:
+   ```
+   User triggers InvokeCI with:
+     git_ref: "abc123def"
+
+   Result:
+     - Checks out commit abc123def
+     - Builds from abc123def
+     - S3 path: s3://duckdb-staging/abc123def/...
+   ```
+
+3. **Nightly builds** (via external scheduler):
+   ```
+   External system triggers via repository_dispatch:
+     git_ref: "main"
+
+   Result:
+     - Builds latest main branch
+     - Notifies external repos
+   ```
 
 **What it calls:**
 - Extensions.yml
@@ -647,11 +818,11 @@ Master workflow that invokes all major CI pipelines in parallel and notifies ext
 - LinuxRelease.yml
 - Windows.yml
 - BundleStaticLibs.yml
-- NotifyExternalRepositories.yml (always runs)
+- NotifyExternalRepositories.yml (always runs, even if builds fail)
 
 **Flow Diagram:**
 ```
-InvokeCI.yml
+InvokeCI.yml (manual/API trigger with git_ref + override_git_describe)
      │
      ├─→ Extensions.yml ──────────┐
      ├─→ OSX.yml ─────────────────┤
@@ -659,8 +830,12 @@ InvokeCI.yml
      ├─→ Windows.yml ─────────────┼─→ Collect Results
      └─→ BundleStaticLibs.yml ────┘
               │
-              └─→ NotifyExternalRepositories.yml
+              └─→ NotifyExternalRepositories.yml (always runs)
 ```
+
+**Artifact Output:**
+- Uploads to S3 staging: `s3://duckdb-staging/{built-commit-sha}/[{version-tag}/]duckdb/duckdb/github_release/`
+- Uploads to extension repo: `s3://duckdb-core-extensions/{version}/{arch}/*.duckdb_extension.gz`
 
 ---
 
@@ -747,10 +922,10 @@ Public Repository (duckdb/duckdb)          Internal/Doc Repositories
 
 Issue/PR/Discussion
       │
-      ├─ [Needs Documentation] ───────────→ duckdb-web
+      ├─ [Needs Documentation] ──────────→ duckdb-web
       │                                     (Documentation tracking)
       │
-      ├─ [needs maintainer approval] ─────→ duckdb-internal
+      ├─ [needs maintainer approval] ────→ duckdb-internal
       │                                     (Approval tracking)
       │
       ├─ [reproduced] ───────────────────→ duckdb-internal
@@ -865,13 +1040,13 @@ Builds and bundles static libraries for multiple platforms with bundled extensio
 ```
 BundleStaticLibs.yml
          │
-         ├─→ macOS [amd64] ──→ Bundle Static Libs ──┐
-         ├─→ macOS [arm64] ──→ Bundle Static Libs ──┤
+         ├─→ macOS [amd64] ───→ Bundle Static Libs ──┐
+         ├─→ macOS [arm64] ───→ Bundle Static Libs ──┤
          │                                           ├─→ Upload to S3
-         ├─→ Windows [MinGW] ─→ Bundle Static Libs ─┤
+         ├─→ Windows [MinGW] ─→ Bundle Static Libs ──┤
          │                                           │
-         ├─→ Linux [amd64] ───→ Bundle Static Libs ─┤
-         └─→ Linux [arm64] ───→ Bundle Static Libs ─┘
+         ├─→ Linux [amd64] ───→ Bundle Static Libs ──┤
+         └─→ Linux [arm64] ───→ Bundle Static Libs ──┘
 ```
 
 ---
@@ -883,68 +1058,223 @@ BundleStaticLibs.yml
 - Manual dispatch
 
 **Purpose:**
-Entry point for release process, immediately calls StagedUpload workflow.
+Entry point for release process. **IMPORTANT**: This workflow does NOT build anything - it only downloads pre-existing artifacts from S3 staging and publishes them to GitHub Releases.
+
+**Prerequisites:**
+- Artifacts must already exist in S3 staging bucket at:
+  `s3://duckdb-staging/{commit-sha}/{version-tag}/duckdb/duckdb/github_release/`
+- Typically created by running InvokeCI.yml BEFORE creating the tag
 
 **Key Jobs:**
-- `staged_upload`: Calls StagedUpload.yml with target version
+- `staged_upload`: Calls StagedUpload.yml with target version from tag name
+
+**Typical Flow:**
+```bash
+# 1. Maintainer runs InvokeCI to build artifacts (this step creates the artifacts)
+# Trigger manually with git_ref="main" and override_git_describe="v1.2.3"
+
+# 2. Wait for builds to complete and upload to S3 staging
+
+# 3. Create and push the version tag (this triggers OnTag.yml)
+git tag v1.2.3
+git push origin v1.2.3
+
+# 4. OnTag.yml triggers and publishes pre-built artifacts to GitHub Release
+```
 
 ---
 
 ### 6. StagedUpload.yml - Artifact Publishing
 
 **Triggers:**
-- Called by other workflows (workflow_call)
+- Called by other workflows (workflow_call) - primarily OnTag.yml
 - Manual dispatch
 
 **Purpose:**
-Downloads pre-built release artifacts from S3 staging bucket and uploads to GitHub releases.
+Downloads pre-built release artifacts from S3 staging bucket and publishes them to GitHub releases. **Does NOT build anything** - only downloads and publishes.
 
 **Key Jobs:**
-- `staged-upload`: Downloads from S3 and publishes to GitHub releases using asset-upload-gha.py
+- `staged-upload`:
+  1. Downloads from S3 staging using `aws s3 cp --recursive`
+  2. Publishes to GitHub releases using `scripts/asset-upload-gha.py`
 
-**S3 Structure:**
+**S3 Download Path:**
 ```
 s3://duckdb-staging/
-    └── {commit_hash}/
-        └── {target_git_describe}/
-            └── {repo}/
+    └── {commit_hash}/              # SHA of the commit that was built
+        └── {target_git_describe}/   # Version tag (e.g., v1.2.3)
+            └── duckdb/duckdb/
                 └── github_release/
-                    └── [artifacts]
+                    ├── duckdb_cli-linux-amd64.zip
+                    ├── duckdb_cli-osx-universal.zip
+                    ├── duckdb_cli-windows-amd64.zip
+                    ├── libduckdb-linux-amd64.zip
+                    ├── libduckdb-osx-universal.zip
+                    ├── libduckdb-windows-amd64.zip
+                    └── ... (all other platform artifacts)
 ```
+
+**GitHub Release Upload:**
+- Uses `asset-upload-gha.py` script
+- Only runs if `GITHUB_REPOSITORY == 'duckdb/duckdb'` (fork protection)
+- Only runs on tag events (not on branches)
+- Uploads all downloaded artifacts as release assets
+
+**Important Notes:**
+- If artifacts don't exist in S3, the workflow will fail
+- The commit SHA and version tag must match what was used during build
+- This is a "publish-only" step - no compilation happens here
 
 ---
 
 ## Release Process Flow
 
-Here's how DuckDB releases work:
+**CRITICAL UNDERSTANDING**: DuckDB uses a **two-stage release process**:
+1. **BUILD stage** (before tagging) - Creates and stages artifacts
+2. **PUBLISH stage** (after tagging) - Downloads and publishes artifacts
+
+This separation allows artifact validation before public release.
+
+---
+
+### Complete Release Process
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         RELEASE PROCESS                             │
+│                    TWO-STAGE RELEASE PROCESS                        │
 └─────────────────────────────────────────────────────────────────────┘
 
-1. Tag Created (v1.0.0)
-   │
-   └─→ OnTag.yml
-         │
-         └─→ StagedUpload.yml
-               │
-               ├─→ Download from S3 staging bucket
-               │   (artifacts built by previous CI runs)
-               │
-               └─→ Upload to GitHub Release
+╔═══════════════════════════════════════════════════════════════════╗
+║ STAGE 1: BUILD (BEFORE TAGGING) - Typically 1-2 hours            ║
+╚═══════════════════════════════════════════════════════════════════╝
 
-Parallel Processes for Tag:
+Step 1: Maintainer manually triggers InvokeCI.yml via GitHub UI
+        Inputs: git_ref="main", override_git_describe="v1.2.3"
    │
-   ├─→ SwiftRelease.yml ──→ Update duckdb-swift repo & create tag
+   └─→ InvokeCI.yml
+        │
+        ├─→ LinuxRelease.yml
+        │   ├─→ Build: linux-amd64, linux-arm64
+        │   ├─→ Create: CLI binaries + libraries + amalgamation
+        │   └─→ Upload to: s3://duckdb-staging/def456/v1.2.3/.../github_release/
+        │
+        ├─→ OSX.yml
+        │   ├─→ Build: macOS universal (Intel + ARM)
+        │   ├─→ Code sign with Apple Developer ID
+        │   ├─→ Notarize with Apple
+        │   └─→ Upload to: s3://duckdb-staging/def456/v1.2.3/.../github_release/
+        │
+        ├─→ Windows.yml
+        │   ├─→ Build: windows-amd64, windows-arm64
+        │   ├─→ Code sign with Azure Trusted Signing
+        │   └─→ Upload to: s3://duckdb-staging/def456/v1.2.3/.../github_release/
+        │
+        ├─→ Extensions.yml
+        │   ├─→ Build: ALL extensions for ALL platforms
+        │   ├─→ Sign extensions with DUCKDB_EXTENSION_SIGNING_PK
+        │   └─→ Upload to: s3://duckdb-core-extensions/v1.2.3/{arch}/...
+        │
+        ├─→ BundleStaticLibs.yml
+        │   ├─→ Build: Static libraries with bundled extensions
+        │   └─→ Upload to: s3://duckdb-staging/def456/v1.2.3/.../github_release/
+        │
+        └─→ NotifyExternalRepositories.yml
+            ├─→ Trigger: duckdb-python (builds Python wheels)
+            ├─→ Trigger: duckdb-odbc (vendors DuckDB source)
+            └─→ Trigger: duckdb-java (builds JDBC drivers)
+
+Result: All artifacts staged at s3://duckdb-staging/def456/v1.2.3/...
+
+╔═══════════════════════════════════════════════════════════════════╗
+║ STAGE 2: PUBLISH (AFTER TAGGING) - ~5-10 minutes                 ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+Step 2: Maintainer creates and pushes version tag
+        $ git tag v1.2.3 def456
+        $ git push origin v1.2.3
    │
-   └─→ InvokeCI.yml (if manually triggered)
-         │
-         ├─→ LinuxRelease.yml ──→ Build Linux binaries ───┐
-         ├─→ OSX.yml ──────────→ Build macOS binaries ────┤
-         ├─→ Windows.yml ───────→ Build Windows binaries ─┤
-         ├─→ Extensions.yml ────→ Build extensions ───────┼─→ Upload to S3 staging
-         └─→ BundleStaticLibs ──→ Build static libs ──────┘
+   ├─→ OnTag.yml (triggered by tag matching v[0-9]+.[0-9]+.[0-9]+)
+   │   │
+   │   └─→ StagedUpload.yml
+   │       ├─→ Download from: s3://duckdb-staging/def456/v1.2.3/.../github_release/*
+   │       └─→ Publish to: GitHub Release (github.com/duckdb/duckdb/releases/tag/v1.2.3)
+   │           ├─→ duckdb_cli-linux-amd64.zip
+   │           ├─→ duckdb_cli-osx-universal.zip
+   │           ├─→ duckdb_cli-windows-amd64.zip
+   │           ├─→ libduckdb-linux-amd64.zip
+   │           ├─→ libduckdb-osx-universal.zip
+   │           ├─→ libduckdb-windows-amd64.zip
+   │           └─→ ... (all platform artifacts)
+   │
+   └─→ SwiftRelease.yml (triggered by any tag)
+       └─→ Sync code to duckdb/duckdb-swift with tag v1.2.3
+
+Result: Public GitHub Release with all artifacts available for download
+```
+
+---
+
+### What Gets Published Where
+
+**GitHub Releases** (`github.com/duckdb/duckdb/releases`)
+- **Contains**: CLI binaries, libraries, headers, amalgamation files
+- **Consumers**:
+  - Manual downloads by users
+  - Homebrew formulas (pulls from GitHub Releases)
+  - Docker images (pulls from GitHub Releases)
+  - CI systems requiring specific versions
+
+**Extension Repository** (`s3://duckdb-core-extensions/`)
+- **Contains**: Signed .duckdb_extension.gz files for all platforms
+- **Accessed by**: DuckDB CLI/clients at runtime
+- **Usage**: `INSTALL extension_name;` and `LOAD extension_name;` commands
+
+**PyPI** (`pypi.org/project/duckdb/`)
+- **Built by**: duckdb-python repository (triggered by NotifyExternalRepositories)
+- **Contains**: Python wheels for all platforms
+- **Usage**: `pip install duckdb`
+
+**Maven Central** (JDBC)
+- **Built by**: duckdb-java repository (triggered by NotifyExternalRepositories)
+- **Contains**: JDBC drivers
+- **Usage**: Maven/Gradle dependencies
+
+**Swift Package Manager**
+- **Built by**: SwiftRelease.yml → duckdb/duckdb-swift
+- **Contains**: Swift package with DuckDB source
+- **Usage**: Swift Package Manager dependencies
+
+**Not Automated in Main Repo:**
+- Homebrew (separate tap repository)
+- apt/deb packages (likely separate infrastructure)
+- Conda packages (external conda-forge process)
+- Julia packages (external process)
+
+---
+
+### Validation Between Stages
+
+**Why Two Stages?**
+
+The two-stage process allows maintainers to:
+1. **Verify builds succeed** across all platforms before tagging
+2. **Test artifacts** from staging bucket before public release
+3. **Coordinate timing** with external repository releases (Python, JDBC, etc.)
+4. **Cancel/retry** if issues found, without polluting git tags
+
+**Example Timeline for v1.2.3 Release:**
+
+```
+Day 1, 10:00 AM - Trigger InvokeCI with git_ref="main", override_git_describe="v1.2.3"
+Day 1, 11:30 AM - All builds complete, artifacts in S3 staging
+Day 1, 12:00 PM - QA team tests artifacts from staging
+Day 1,  2:00 PM - External repos (Python, JDBC) start their builds
+Day 1,  4:00 PM - Maintainer validates everything looks good
+Day 1,  4:30 PM - Create and push tag v1.2.3
+Day 1,  4:35 PM - OnTag publishes to GitHub Release
+Day 1,  5:00 PM - Users can download v1.2.3 from GitHub
+Day 2, 10:00 AM - Python wheels available on PyPI
+Day 2, 12:00 PM - JDBC drivers available on Maven
 ```
 
 ### Typical Development Flow
